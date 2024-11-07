@@ -1,0 +1,226 @@
+---
+steps:
+  # FIXME: if two builds started at the same time they will block each other
+  # indefinitely. We need to have some kind of queue to know which build started
+  # first, and let this one proceed if needed. Maybe Pub/Sub from GCP can help?
+  - id: Wait until parallel instances of this build completed
+    name: gcr.io/cloud-builders/gcloud@sha256:4d329656103c8a5851e966f177a4d45c70d6d63f0de5fbeabd21e1a4947c32f9
+    entrypoint: bash
+    args:
+      - -ceuo
+      - pipefail
+      - |
+        function get_build_trigger_id() {
+          echo "$(gcloud builds describe "$$1" | awk '$$1 == "buildTriggerId:" {print $$2}')"
+        }
+
+        cur_build_trigger_id="$(get_build_trigger_id "$BUILD_ID")"
+
+        while (true); do
+          retry=1
+          for build_id in $(gcloud builds list --ongoing | awk 'NR > 1 {print $$1}'); do
+            [[ "$BUILD_ID" == "$$build_id" ]] && continue
+
+            build_trigger_id="$(get_build_trigger_id "$$build_id")"
+            if [[ "$$cur_build_trigger_id" == "$$build_trigger_id" ]]; then
+              echo "Other instances of this build running. Waiting for them to finish."
+              sleep 10
+              retry=0
+              break
+            fi
+          done
+
+          [[ $$retry -eq 1 ]] && break
+        done
+
+  - id: Setup
+    name: gcr.io/cloud-builders/git@sha256:00557896b9dbae78e37f6e1ad10dab7edbc54d425fb222031545523e35a897fc
+    entrypoint: bash
+    args:
+      - -ceuo
+      - pipefail
+      - |
+        # Restore .git dir removed by GCB:
+        ssh-keyscan -t rsa github.com >> /root/.ssh/known_hosts
+        git init
+        git remote add origin https://github.com/${_GITHUB_DEMO_OWNER}/${_GITHUB_DEMO_REPONAME}
+        git fetch
+        git reset --hard origin/master
+        git branch -u origin/master
+
+        # Setup git
+        git config user.name "Google Cloud Build"
+        git config user.email "gcb@example.org"
+        git submodule update --init
+
+        # Get list of apps to update
+        apps="$(echo $TAG_NAME | cut -d'_' -f2- | tr '_' ' ')"
+        if [[ "$$apps" == "all" ]]; then
+          apps="$(ls -m third-party/microservices/src/ | tr -d ',')"
+        fi
+        echo "$$apps" > /config/apps
+
+  - id: Build, push microservices to GCR
+    name: gcr.io/kaniko-project/executor:debug-v0.15.0
+    entrypoint: sh
+    args:
+      - -ce
+      - |
+        for app in $(cat /config/apps); do
+          executor --context=third-party/microservices/src/$$app \
+            --destination=gcr.io/$PROJECT_ID/$$app:$SHORT_SHA \
+            --cache=false --single-snapshot
+        done
+
+  - id: Decrypt ssh private key
+    name: gcr.io/cloud-builders/gcloud@sha256:4d329656103c8a5851e966f177a4d45c70d6d63f0de5fbeabd21e1a4947c32f9
+    entrypoint: bash
+    args:
+      - -ceuo
+      - pipefail
+      - |
+        base64 -d id_rsa.enc | \
+        gcloud -q kms decrypt --ciphertext-file=- --plaintext-file=/root/.ssh/id_rsa \
+          --location=global --keyring=$_KMS_KEYRING_NAME --key=$_KMS_KEY_NAME_GITHUB
+
+  - id: Setup git authorization
+    name: gcr.io/cloud-builders/git@sha256:00557896b9dbae78e37f6e1ad10dab7edbc54d425fb222031545523e35a897fc
+    entrypoint: bash
+    args:
+      - -ceuo
+      - pipefail
+      - |
+        cat <<EOF > /root/.ssh/config
+        Hostname github.com
+        IdentityFile /root/.ssh/id_rsa
+        EOF
+
+        chmod 600 /root/.ssh/id_rsa
+        git remote set-url origin git@github.com:${_GITHUB_DEMO_OWNER}/${_GITHUB_DEMO_REPONAME}
+
+  - id: "[staging] Update images tags to new versions in Kubernetes manifests"
+    name: ilyalesikov/kustomize
+    dir: ./kubernetes/overlays/staging
+    entrypoint: bash
+    args:
+      - -ceuo
+      - pipefail
+      - |
+        for app in $(cat /config/apps); do
+          kustomize edit set image $$app=gcr.io/$PROJECT_ID/$$app:$SHORT_SHA
+        done
+
+  - id: "[staging] Commit, push images tags update"
+    name: gcr.io/cloud-builders/git@sha256:00557896b9dbae78e37f6e1ad10dab7edbc54d425fb222031545523e35a897fc
+    dir: ./kubernetes/overlays/staging
+    entrypoint: bash
+    args:
+      - -ceuo
+      - pipefail
+      - |
+        git add kustomization.yml
+        git commit -m '[CI/staging] Update images tags' || true
+        git push
+
+  - id: "[staging] Deploy, test applications"
+    name: ilyalesikov/gke-demo
+    dir: ./terraform/environments/staging/kubernetes
+    entrypoint: bash
+    args:
+      - -ceuo
+      - pipefail
+      - |
+        terragrunt apply-all --terragrunt-non-interactive \
+          --terragrunt-include-external-dependencies
+        argocd app sync hipstershop-staging --prune --timeout 300
+        argocd app wait hipstershop-staging --health --timeout 300
+
+        # TODO: implement proper e2e testing
+        tries=0
+        until (kubectl get services -n hipstershop frontend-external 2>&1 1>/dev/null); do
+          if [[ $$tries -gt 20 ]]; then
+            echo "Can't find frontend-external service. Aborting"
+            exit 1
+          fi
+          tries=$((tries+1))
+          sleep 2
+        done
+        ip="$(kubectl get services -n hipstershop frontend-external \
+            -o custom-columns=IP:.status.loadBalancer.ingress[0].ip --no-headers)"
+
+        tries=0
+        until (curl -sSL "http://$$ip" | grep '>Buy<' 1>/dev/null); do
+          if [[ $$tries -gt 40 ]]; then
+            echo "Can't reach application on http://$$ip with curl. Aborting"
+            exit 1
+          fi
+          tries=$((tries+1))
+          sleep 2
+        done
+
+  - id: "[staging] Destroy applications"
+    name: ilyalesikov/gke-demo
+    dir: ./terraform/environments/staging/kubernetes
+    entrypoint: bash
+    args:
+      - -ceuo
+      - pipefail
+      - |
+        terragrunt destroy -target=k8s_manifest.hipstershop-argo-app -auto-approve
+
+  - id: "[prod] Update images tags to new versions in Kubernetes manifests"
+    name: ilyalesikov/kustomize
+    dir: ./kubernetes/overlays/prod
+    entrypoint: bash
+    args:
+      - -ceuo
+      - pipefail
+      - |
+        for app in $(cat /config/apps); do
+          kustomize edit set image $$app=gcr.io/$PROJECT_ID/$$app:$SHORT_SHA
+        done
+
+  - id: "[prod] Commit, push images tags update"
+    name: gcr.io/cloud-builders/git@sha256:00557896b9dbae78e37f6e1ad10dab7edbc54d425fb222031545523e35a897fc
+    dir: ./kubernetes/overlays/prod
+    entrypoint: bash
+    args:
+      - -ceuo
+      - pipefail
+      - |
+        git pull --rebase --autostash
+        git add kustomization.yml
+        git commit -m '[CI/prod] Update images tags' || true
+        git push
+
+  - id: "[prod] Canary deploy applications"
+    name: ilyalesikov/gke-demo
+    dir: ./terraform/environments/staging/kubernetes
+    entrypoint: bash
+    args:
+      - -ceuo
+      - pipefail
+      - |
+        argocd app sync hipstershop-prod --prune --timeout 300
+        argocd app wait hipstershop-prod --health --timeout 300
+
+timeout: 2h
+options:
+  volumes:
+    - name: config
+      path: /config
+    - name: ssh
+      path: /root/.ssh
+    - name: argocd
+      path: /root/.argocd
+    - name: gsutil
+      path: /root/.gsutil
+    - name: gcloud
+      path: /root/.config/gcloud
+    - name: kubectl
+      path: /root/.kube
+    - name: docker
+      path: /root/.docker
+  env:
+    - HOME=/root
+    - TF_VAR_project_id=$PROJECT_ID

@@ -1,0 +1,18 @@
+apiVersion: argoproj.io/v1alpha1
+kind: Application
+metadata:
+  name: "${app_name}"
+  namespace: "${app_namespace}"
+  finalizers:
+  - resources-finalizer.argocd.argoproj.io
+spec:
+  project: default
+  source:
+    repoURL: "https://github.com/${github_demo_owner}/${github_demo_reponame}"
+    targetRevision: master
+    path: "${manifests_dir}"
+    kustomize: {}
+  destination:
+    server: "${k8s_cluster_url}"
+    namespace: "${destination_namespace}"
+  syncPolicy: {}
